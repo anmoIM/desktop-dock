@@ -106,6 +106,91 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
 
+class FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", wintypes.DWORD),
+        ("dwHighDateTime", wintypes.DWORD),
+    ]
+
+
+class WIN32_FIND_DATAW(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", FILETIME),
+        ("ftLastAccessTime", FILETIME),
+        ("ftLastWriteTime", FILETIME),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("dwReserved0", wintypes.DWORD),
+        ("dwReserved1", wintypes.DWORD),
+        ("cFileName", wintypes.WCHAR * 260),
+        ("cAlternateFileName", wintypes.WCHAR * 14),
+    ]
+
+
+# {00021401-0000-0000-C000-000000000046} / {000214F9-...} / {0000010B-...}
+CLSID_SHELLLINK = bytes.fromhex("0114020000000000c000000000000046")
+IID_ISHELLLINKW = bytes.fromhex("f914020000000000c000000000000046")
+IID_IPERSISTFILE = bytes.fromhex("0b01000000000000c000000000000046")
+CLSCTX_INPROC_SERVER = 1
+STGM_READ = 0
+SLGP_RAWPATH = 4
+
+_ole32.CoCreateInstance.argtypes = [
+    ctypes.POINTER(GUID), c_void_p, wintypes.DWORD,
+    ctypes.POINTER(GUID), ctypes.POINTER(c_void_p),
+]
+_ole32.CoCreateInstance.restype = ctypes.c_long
+
+
+def resolve_shortcut(path):
+    """解析 .lnk 指向的目标路径，失败返回空串。
+
+    用途：取目标图标，这样就不会带快捷方式的小箭头角标。
+    """
+    try:
+        _ole32.CoInitializeEx(None, 0x2)
+        clsid = GUID.from_buffer_copy(CLSID_SHELLLINK)
+        iid_link = GUID.from_buffer_copy(IID_ISHELLLINKW)
+        iid_persist = GUID.from_buffer_copy(IID_IPERSISTFILE)
+        link = c_void_p()
+        hr = _ole32.CoCreateInstance(
+            byref(clsid), None, CLSCTX_INPROC_SERVER, byref(iid_link), byref(link)
+        )
+        if hr != 0 or not link:
+            return ""
+        target = ""
+        persist = c_void_p()
+        # IShellLink::QueryInterface
+        hr = _com_call(
+            link, 0, ctypes.c_long,
+            [ctypes.POINTER(GUID), ctypes.POINTER(c_void_p)],
+            byref(iid_persist), byref(persist),
+        )
+        if hr == 0 and persist:
+            # IPersistFile::Load
+            hr = _com_call(
+                persist, 5, ctypes.c_long, [ctypes.c_wchar_p, wintypes.DWORD],
+                path, STGM_READ,
+            )
+            if hr == 0:
+                buffer = ctypes.create_unicode_buffer(1024)
+                data = WIN32_FIND_DATAW()
+                # IShellLink::GetPath
+                if _com_call(
+                    link, 3, ctypes.c_long,
+                    [ctypes.c_wchar_p, ctypes.c_int,
+                     ctypes.POINTER(WIN32_FIND_DATAW), wintypes.DWORD],
+                    buffer, 1024, byref(data), SLGP_RAWPATH,
+                ) == 0:
+                    target = buffer.value
+            _com_call(persist, 2, ctypes.c_ulong, [])
+        _com_call(link, 2, ctypes.c_ulong, [])
+        return target
+    except OSError:
+        return ""
+
+
 _shell32.SHGetDesktopFolder.argtypes = [POINTER(c_void_p)]
 _shell32.SHGetDesktopFolder.restype = ctypes.c_long
 _shell32.SHGetNameFromIDList.argtypes = [

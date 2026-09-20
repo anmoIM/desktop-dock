@@ -28,11 +28,11 @@ from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QMenu,
-    QMessageBox,
     QSystemTrayIcon,
 )
 
 from kjsl import autostart, desktop_icons, taskbar, theme
+from kjsl.desktop import desktop_dirs
 from kjsl.config import Config
 from kjsl.hotkey import HotkeyManager
 from kjsl.panel import Panel, TooltipStyle
@@ -87,18 +87,15 @@ class AppController(QObject):
         self.config = Config.load()
         self._sync_autostart()
 
-        self.panel = Panel(self.config, on_open_settings=self.open_settings)
-        self.panel.message.connect(self.notify)
-
-        self.hotkey = HotkeyManager(self.panel.toggle)
+        self.panels = {}      # 收纳区 id -> 面板
+        self.hotkeys = {}     # 收纳区 id -> 热键
+        self._build_panels()
 
         self.tray = QSystemTrayIcon(build_tray_icon(), self)
         self._set_tray_tip()
         self._build_menu()
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
-
-        self.panel.start()
 
         # 运行期间持续保持桌面图标隐藏（资源管理器重启等情况下会被重新显示）
         self._icon_guard = QTimer(self)
@@ -117,34 +114,181 @@ class AppController(QObject):
         if self.config.get("taskbar_transparent"):
             self.apply_taskbar(True)
 
-        self._setup_hotkey()
+        self._setup_hotkeys()
 
-    def _setup_hotkey(self):
-        """注册配置里的热键；被占用时自动退到备选组合并告知用户。"""
-        configured = str(self.config.get("hotkey"))
-        if self.hotkey.register(configured):
-            return
-        for candidate in FALLBACK_HOTKEYS:
-            if candidate == configured:
+    def _build_panels(self):
+        """按配置里的收纳区逐个建面板。"""
+        for zone in self.config.zones():
+            panel = Panel(
+                self.config,
+                zone,
+                on_open_settings=self.open_settings,
+                on_drop_out=self.handle_drop_out,
+            )
+            panel.message.connect(self.notify)
+            panel.move_zone_requested.connect(self.move_item_to_zone)
+            panel.paths_dropped.connect(self.add_dropped)
+            panel.content_changed.connect(self.refresh_other_panels)
+            self.panels[zone["id"]] = panel
+        for panel in self.panels.values():
+            panel.start()
+
+    def _setup_hotkeys(self):
+        """每个收纳区各自的热键；第一个区被占用时自动退到备选组合。"""
+        for zone in self.config.zones():
+            panel = self.panels.get(zone["id"])
+            text = str(zone.get("hotkey") or "")
+            if panel is None or not text:
                 continue
-            if self.hotkey.register(candidate):
-                self.config.set("hotkey", candidate)
-                self.config.save()
-                self._set_tray_tip()
-                self.notify(
-                    "热键 %s 已被其他程序占用，已自动改用 %s" % (configured, candidate)
-                )
-                return
-        self.notify("热键 %s 注册失败，请在设置中更换" % configured)
+            manager = HotkeyManager(panel.toggle)
+            if manager.register(text):
+                self.hotkeys[zone["id"]] = manager
+                continue
+            if zone["id"] != self.config.first_zone_id():
+                self.notify("「%s」的热键 %s 注册失败，请在设置中更换" % (zone.get("name"), text))
+                continue
+            for candidate in FALLBACK_HOTKEYS:
+                if candidate == text:
+                    continue
+                if manager.register(candidate):
+                    zone["hotkey"] = candidate
+                    self.config.save()
+                    self._set_tray_tip()
+                    self.notify(
+                        "热键 %s 已被其他程序占用，已自动改用 %s" % (text, candidate)
+                    )
+                    self.hotkeys[zone["id"]] = manager
+                    break
+            else:
+                self.notify("热键 %s 注册失败，请在设置中更换" % text)
+
+    def _reload_hotkeys(self):
+        for manager in self.hotkeys.values():
+            manager.unregister()
+        self.hotkeys = {}
+        self._setup_hotkeys()
 
     def _set_tray_tip(self):
-        self.tray.setToolTip("桌面收录 · %s 呼出面板" % self.config.get("hotkey"))
+        zones = self.config.zones()
+        texts = [str(zone.get("hotkey") or "") for zone in zones]
+        texts = [text for text in texts if text]
+        if len(zones) == 1:
+            self.tray.setToolTip("桌面收录 · %s 呼出面板" % (texts[0] if texts else ""))
+        else:
+            self.tray.setToolTip(
+                "桌面收录 · %d 个收纳区（%s）" % (len(zones), "、".join(texts))
+            )
+
+    # ---------- 收纳区 ----------
+
+    def zone_of(self, item):
+        """图标当前属于哪个收纳区。"""
+        return self.config.zone_of(item.key)
+
+    def panel_at(self, global_pos):
+        """屏幕坐标落在哪个面板上（用于跨收纳区拖动）。"""
+        for panel in self.panels.values():
+            if panel.isVisible() and panel.frameGeometry().contains(global_pos):
+                return panel
+        return None
+
+    def handle_drop_out(self, item, global_pos):
+        """图标被拖到面板外松手：落到哪个收纳区就改属哪个区。"""
+        target = self.panel_at(global_pos)
+        if target is None:
+            return False
+        zone_id = target.zone.get("id")
+        if zone_id == self.zone_of(item):
+            return False
+        point = target.drop_point(global_pos)
+        positions = dict(self.config.get("positions") or {})
+        positions[item.key] = list(point)
+        self.config.set("positions", positions)
+        mapping = dict(self.config.get("zone_of") or {})
+        mapping[item.key] = zone_id
+        self.config.set("zone_of", mapping)
+        self.config.save()
+        for panel in self.panels.values():
+            panel.refresh()
+        self.notify("「%s」已移入「%s」" % (item.display_name, target.zone.get("name")))
+        return True
+
+    def refresh_other_panels(self, source):
+        """图标归属变了：除了发起的面板，其他面板也重新扫一遍。"""
+        for zone_id, panel in self.panels.items():
+            if panel is not source:
+                panel.refresh()
+
+    def add_dropped(self, panel, paths, global_pos):
+        """从桌面/资源管理器拖进面板的文件：收进该面板所属的收纳区。"""
+        zone_id = panel.zone.get("id")
+        excluded = list(self.config.get("excluded") or [])
+        custom = list(self.config.get("custom") or [])
+        mapping = dict(self.config.get("zone_of") or {})
+        positions = dict(self.config.get("positions") or {})
+        desktops = {
+            os.path.normcase(os.path.abspath(path)) for path in desktop_dirs()
+        }
+        base_x, base_y = panel.drop_point(global_pos)
+        names = []
+        for index, path in enumerate(paths):
+            full = os.path.abspath(path)
+            if not os.path.exists(full):
+                continue
+            key = os.path.normcase(full)
+            if key in excluded:
+                excluded.remove(key)          # 之前被移除过，重新收进来
+            if os.path.dirname(key) not in desktops and full not in custom:
+                custom.append(full)           # 桌面之外的路径记进手动添加
+            mapping[key] = zone_id            # 落到哪个区就归哪个区
+            positions[key] = [
+                base_x + (index % 4) * 14,
+                base_y + (index % 4) * 14,
+            ]
+            names.append(os.path.basename(full))
+        if not names:
+            self.notify("拖进来的路径不存在，已忽略")
+            return
+        self.config.set("excluded", excluded)
+        self.config.set("custom", custom)
+        self.config.set("zone_of", mapping)
+        self.config.set("positions", positions)
+        self.config.save()
+        for item in self.panels.values():
+            item.refresh()
+        self.notify(
+            "已收录「%s」到「%s」" % ("」「".join(names[:3]), panel.zone.get("name"))
+            if len(names) <= 3
+            else "已收录 %d 个图标到「%s」" % (len(names), panel.zone.get("name"))
+        )
+
+    def move_item_to_zone(self, item, zone_id):
+        """右键菜单换区：图标落到目标区的空位。"""
+        zone = self.config.zone(zone_id)
+        if zone is None or zone_id == self.zone_of(item):
+            return
+        mapping = dict(self.config.get("zone_of") or {})
+        mapping[item.key] = zone_id
+        self.config.set("zone_of", mapping)
+        positions = dict(self.config.get("positions") or {})
+        positions.pop(item.key, None)      # 到新收纳区按空位重新排
+        self.config.set("positions", positions)
+        self.config.save()
+        for panel in self.panels.values():
+            panel.refresh()
+        self.notify("「%s」已移入「%s」" % (item.display_name, zone.get("name")))
+
+    def toggle_zone(self, zone_id):
+        panel = self.panels.get(zone_id)
+        if panel is not None:
+            panel.toggle()
 
     # ---------- 托盘 ----------
 
     def _build_menu(self):
         menu = QMenu()
-        menu.addAction("显示 / 隐藏面板").triggered.connect(self.panel.toggle)
+        self.zones_menu = menu.addMenu("收纳区")
+        self._sync_zones_menu()
         menu.addSeparator()
         menu.addAction("重新扫描桌面").triggered.connect(self.rescan)
         menu.addAction("重置图标位置").triggered.connect(self.reset_positions)
@@ -170,7 +314,24 @@ class AppController(QObject):
         self.tray.setContextMenu(menu)
         self._sync_menu()
 
+    def _sync_zones_menu(self):
+        """收纳区子菜单：每个区一个显示/隐藏项，末尾进设置管理。"""
+        self.zones_menu.clear()
+        for zone in self.config.zones():
+            zone_id = zone["id"]
+            panel = self.panels.get(zone_id)
+            hotkey = str(zone.get("hotkey") or "")
+            label = "显示 / 隐藏「%s」" % zone.get("name")
+            if hotkey:
+                label += "（%s）" % hotkey
+            action = self.zones_menu.addAction(label)
+            action.triggered.connect(lambda _=False, zid=zone_id: self.toggle_zone(zid))
+            action.setEnabled(panel is not None)
+        self.zones_menu.addSeparator()
+        self.zones_menu.addAction("管理收纳区...").triggered.connect(self.open_settings)
+
     def _sync_menu(self):
+        self._sync_zones_menu()
         self.action_top.setChecked(bool(self.config.get("always_on_top")))
         self.action_start.setChecked(autostart.is_enabled())
         self.action_hide_icons.setChecked(bool(self.config.get("hide_desktop_icons")))
@@ -178,8 +339,14 @@ class AppController(QObject):
 
     def _on_tray_activated(self, reason):
         # 只响应双击：单击与双击会先后触发，同时监听会导致切换两次等于没反应
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.panel.toggle()
+        if reason != QSystemTrayIcon.DoubleClick:
+            return
+        panel = self.panels.get(self.config.first_zone_id())
+        if panel is not None:
+            panel.toggle()
+
+    def _each_panel(self):
+        return list(self.panels.values())
 
     def notify(self, text):
         self.tray.showMessage("桌面收录", text, QSystemTrayIcon.Information, 3000)
@@ -187,13 +354,19 @@ class AppController(QObject):
     # ---------- 菜单动作 ----------
 
     def rescan(self):
-        self.panel.refresh()
-        self.notify("已重新扫描桌面，共收录 %d 个图标" % len(self.panel.items))
+        total = 0
+        for panel in self._each_panel():
+            panel.refresh()
+            total += len(panel.items)
+        self.notify("已重新扫描桌面，共收录 %d 个图标" % total)
 
     def reset_positions(self):
         self.config.set("positions", {})
         self.config.save()
-        self.panel.refresh()
+        for panel in self._each_panel():
+            for widget in panel.icons:
+                widget.moved_by_user = False
+            panel.refresh()
         self.notify("图标位置已重置为自动排列")
 
     def restore_removed(self):
@@ -202,13 +375,15 @@ class AppController(QObject):
             return
         self.config.set("excluded", [])
         self.config.save()
-        self.panel.refresh()
+        for panel in self._each_panel():
+            panel.refresh()
         self.notify("已恢复全部被移除的图标")
 
     def _toggle_top(self):
         self.config.set("always_on_top", self.action_top.isChecked())
         self.config.save()
-        self.panel.apply_config()
+        for panel in self._each_panel():
+            panel.apply_config()
 
     def _toggle_autostart(self):
         enabled = self.action_start.isChecked()
@@ -289,25 +464,31 @@ class AppController(QObject):
     # ---------- 设置 ----------
 
     def open_settings(self):
-        dialog = SettingsDialog(
-            self.config, current_width=self.panel._w, current_height=self.panel._h
-        )
+        sizes = {
+            zone_id: (panel._w, panel._h) for zone_id, panel in self.panels.items()
+        }
+        dialog = SettingsDialog(self.config, sizes=sizes)
         if dialog.exec_() != QDialog.Accepted:
             return
         values = dialog.values()
 
-        old_hotkey = str(self.config.get("hotkey"))
-        new_hotkey = values.pop("hotkey")
-        if new_hotkey != old_hotkey:
-            if self.hotkey.register(new_hotkey):
-                self.config.set("hotkey", new_hotkey)
-                self._set_tray_tip()
-            else:
-                QMessageBox.warning(
-                    None,
-                    "热键注册失败",
-                    "「%s」已被其他程序占用，已保留原热键 %s。" % (new_hotkey, old_hotkey),
-                )
+        zones = values.pop("zones", None)
+        if isinstance(zones, list) and zones:
+            old_zones = {zone["id"] for zone in self.config.zones()}
+            self.config.set("zones", zones)
+            # 收纳区被删掉后，里面的图标回到第一个区，位置也重新排
+            valid = {zone["id"] for zone in zones}
+            removed = old_zones - valid
+            mapping = self.config.get("zone_of") or {}
+            gone = {key for key, zone_id in mapping.items() if zone_id in removed}
+            self.config.set(
+                "zone_of",
+                {key: zone_id for key, zone_id in mapping.items() if zone_id in valid},
+            )
+            positions = dict(self.config.get("positions") or {})
+            for key in gone:
+                positions.pop(key, None)
+            self.config.set("positions", positions)
 
         old_hide_icons = bool(self.config.get("hide_desktop_icons"))
         old_taskbar = bool(self.config.get("taskbar_transparent"))
@@ -318,7 +499,7 @@ class AppController(QObject):
             self.notify("修改开机自启动失败，可能被安全软件拦截")
 
         self.config.save()
-        self.panel.apply_config()
+        self._sync_panels()
         new_hide_icons = bool(self.config.get("hide_desktop_icons"))
         if new_hide_icons != old_hide_icons:
             self.set_desktop_icons_hidden(new_hide_icons)
@@ -327,6 +508,38 @@ class AppController(QObject):
             self.apply_taskbar(new_taskbar, notify=True)
         self._sync_menu()
 
+    def _sync_panels(self):
+        """按最新配置补齐/移除面板，并重新应用各区的设置。"""
+        zones = self.config.zones()
+        wanted = {zone["id"] for zone in zones}
+        for zone_id in list(self.panels):
+            if zone_id not in wanted:
+                panel = self.panels.pop(zone_id)
+                panel.save_positions()
+                panel.hide()
+                panel.deleteLater()
+        for zone in zones:
+            zone_id = zone["id"]
+            if zone_id not in self.panels:
+                panel = Panel(
+                    self.config,
+                    zone,
+                    on_open_settings=self.open_settings,
+                    on_drop_out=self.handle_drop_out,
+                )
+                panel.message.connect(self.notify)
+                panel.move_zone_requested.connect(self.move_item_to_zone)
+                panel.paths_dropped.connect(self.add_dropped)
+                panel.content_changed.connect(self.refresh_other_panels)
+                self.panels[zone_id] = panel
+                panel.start()
+            else:
+                panel = self.panels[zone_id]
+                panel.set_zone(zone)      # 区数据是新的对象，指向它才会生效
+                panel.apply_config()
+        self._reload_hotkeys()
+        self._set_tray_tip()
+
     # ---------- 退出 ----------
 
     def quit(self):
@@ -334,8 +547,11 @@ class AppController(QObject):
         self.app.quit()
 
     def shutdown(self):
-        self.panel.save_positions()
-        self.hotkey.unregister()
+        for panel in self._each_panel():
+            panel.save_positions()
+        for manager in self.hotkeys.values():
+            manager.unregister()
+        self.hotkeys = {}
         self._icon_guard.stop()
         self._taskbar_guard.stop()
         # 退出时把桌面图标恢复原样，避免关掉程序后桌面上什么都点不到

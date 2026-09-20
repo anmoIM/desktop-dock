@@ -3,6 +3,7 @@
 import ctypes
 import math
 import os
+import time
 from ctypes import wintypes
 
 from PyQt5.QtCore import (
@@ -45,6 +46,7 @@ from PyQt5.QtWidgets import (
 )
 
 from . import foreground, shell_items, theme
+from .config import ZoneConfig
 from .desktop import desktop_dirs, scan
 
 PAD = 8
@@ -56,11 +58,17 @@ HOVER_POLL = 40         # 展开状态下的光标检测间隔
 SLIDE_IN_MS = 190       # 展开动画时长
 SLIDE_OUT_MS = 120      # 收起动画时长（比展开更快，避免挡手）
 RESIZE_BAND = 9
-MIN_WIDTH = 110
+COLLAPSED_H = 38        # 折叠后只留标题栏的高度
+MIN_WIDTH = 150         # 再窄标题和标题栏上的按钮就挤在一起了
 MIN_HEIGHT = 220
 WATCH_DELAY = 900       # 桌面有变动后延迟多久重新扫描
-TILE_TEXT_PAD = 54      # 磁贴宽度 = 图标宽度 + 文字预留
-TILE_TEXT_PAD_MIN = 20  # 不显示文字时的磁贴留白
+TILE_TEXT_PAD_MIN = 20  # 磁贴宽度 = 图标宽度 + 左右留白（显示文字时也不变）
+TRAIL_TICK_MS = 16      # 拖尾刷新间隔（约 60 帧）
+TRAIL_BASE_MS = 110     # 拖尾 1 档的时长
+TRAIL_STEP_MS = 35      # 每加一档多留 35ms
+TRAIL_ALPHA = 150       # 最浓的那个残影的不透明度
+TRAIL_FRAMES = 5        # 预先生成几档大小的残影
+TRAIL_SKIP = 0.12       # 比这个还新的点不画，免得压住图标本体
 
 WM_SYSCOMMAND = 0x0112
 SC_MINIMIZE = 0xF020
@@ -122,7 +130,54 @@ def wrap_text(text, metrics, width, max_lines=2):
     return lines
 
 
+# 文字自适应结果：{(名称, 宽度, 可用高度, 基准字号): (字体, 折行结果)}
+_LABEL_FIT_CACHE = {}
+LABEL_MIN_PT = 6        # 自适应时最小缩到几号字
+LABEL_MAX_LINES = 4     # 自适应时最多折几行
+
+
+def fit_label(name, base_font, width, height, min_pt=LABEL_MIN_PT):
+    """把名字完整塞进格子里：先按原字号折行，放不下就逐级缩小字号，
+    字号小了行高也小，格子里能多折一行，所以长名字多半不用省略号。
+
+    返回 (实际用的字体, 折好的行, 该字体的行高)；实在放不下才省略收尾。
+    """
+    key = (name, width, height, base_font.pointSize())
+    cached = _LABEL_FIT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def attempt(size):
+        font = QFont(base_font)
+        font.setPointSize(size)
+        metrics = QFontMetrics(font)
+        line_h = max(1, metrics.height())
+        room = max(1, min(LABEL_MAX_LINES, height // line_h))
+        return font, metrics, wrap_text(name, metrics, width, room), line_h
+
+    chosen = None
+    size = max(int(base_font.pointSize()), min_pt)
+    while size >= min_pt:
+        font, metrics, lines, line_h = attempt(size)
+        if not lines or not lines[-1].endswith("…"):
+            chosen = (font, lines, line_h)
+            break
+        size -= 1
+    if chosen is None:
+        font, metrics, lines, line_h = attempt(min_pt)
+        chosen = (font, lines, line_h)
+
+    if len(_LABEL_FIT_CACHE) > 400:
+        _LABEL_FIT_CACHE.clear()
+    _LABEL_FIT_CACHE[key] = chosen
+    return chosen
+
+
 _provider = None
+# 快捷方式目标解析缓存：{路径: (修改时间, 目标路径或 "")}，没改动就不重复解析
+_SHORTCUT_CACHE = {}
+# 目标图标位图缓存：{(目标路径, 尺寸): QPixmap}，Shell 取图标偏慢，缓存后刷新即时完成
+_TARGET_ICON_CACHE = {}
 
 
 IMAGE_SUFFIX = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico", ".webp")
@@ -133,23 +188,35 @@ def file_icon(path, size):
     global _provider
     if _provider is None:
         _provider = QFileIconProvider()
-    return _provider.icon(QFileInfo(path)).pixmap(size, size)
+    pixmap = _provider.icon(QFileInfo(path)).pixmap(size, size)
+    if pixmap.width() > size or pixmap.height() > size:
+        # Qt 有时会返回比要求更大的位图（例如 48px），会压住图标下方的文字
+        pixmap = pixmap.scaled(
+            size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+    return pixmap
 
 
-def load_override_icon(path, size):
-    """加载用户指定的图标文件：图片直接读，程序/快捷方式取系统图标。"""
-    if not path or not os.path.exists(path):
-        return None
-    if path.lower().endswith(IMAGE_SUFFIX):
-        pixmap = QPixmap(path)
-        if not pixmap.isNull():
-            return pixmap.scaled(
-                size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-    return file_icon(path, size)
+def shortcut_source(path):
+    """快捷方式换成它指向的目标，这样取的图标不带左下角的小箭头。"""
+    lower = path.lower()
+    if lower.endswith(".lnk"):
+        target = shell_items.resolve_shortcut(path)
+        return target if target and os.path.exists(target) else ""
+    if lower.endswith(".url"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    field, _, value = line.partition("=")
+                    if field.strip().lower() == "iconfile":
+                        target = os.path.expandvars(value.strip().strip('"'))
+                        return target if target and os.path.exists(target) else ""
+        except OSError:
+            return ""
+    return ""
 
 
-def load_item_icon(item, size):
+def load_item_icon(item, size, hide_arrow=False):
     """系统图标走 Shell 命名空间，其余走文件图标；自定义图标优先。"""
     if item.icon_path:
         pixmap = load_override_icon(item.icon_path, size)
@@ -159,7 +226,172 @@ def load_item_icon(item, size):
         pixmap = shell_items.load_icon(item.path, size)
         if pixmap is not None and not pixmap.isNull():
             return pixmap
+    if hide_arrow and not item.is_dir:
+        target = shortcut_target(item.path)
+        if target:
+            pixmap = target_icon(target, size)
+            if pixmap is not None and not pixmap.isNull():
+                return pixmap
     return file_icon(item.path, size)
+
+
+def target_icon(target, size):
+    """取快捷方式目标自身的图标（不带小箭头），结果缓存。"""
+    key = (os.path.normcase(target), size)
+    if key in _TARGET_ICON_CACHE:
+        return _TARGET_ICON_CACHE[key]
+    # Qt 的图标引擎拿不到可执行文件里的图标，走 Shell 才不掉成白纸图标
+    pixmap = shell_items.load_icon(target, size)
+    if pixmap is not None and not pixmap.isNull():
+        if len(_TARGET_ICON_CACHE) > 400:
+            _TARGET_ICON_CACHE.clear()
+        _TARGET_ICON_CACHE[key] = pixmap
+    return pixmap
+
+
+def shortcut_target(path):
+    """带缓存的快捷方式目标查询；快捷方式被改动时会自动重新解析。"""
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return ""
+    cached = _SHORTCUT_CACHE.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    target = shortcut_source(path)
+    _SHORTCUT_CACHE[path] = (stamp, target)
+    return target
+
+
+class DragTrail(QWidget):
+    """拖动图标时的拖尾：一串逐渐变小、淡出的残影跟着鼠标走。
+
+    独立透明窗口，可以画到面板外面（跨收纳区拖动时也看得到），不接收鼠标事件。
+    """
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(
+            parent,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        # 预先按不同大小生成残影，绘制时直接取用，省掉每帧缩放
+        self._frames = []
+        for index in range(TRAIL_FRAMES):
+            scale = 0.55 + 0.45 * (index / float(TRAIL_FRAMES - 1))
+            size = max(8, int(pixmap.width() * scale))
+            self._frames.append(
+                pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        self._pad = pixmap.width() // 2 + 10
+        self._samples = []          # [(时间戳, 全局坐标)]
+        self._duration = 0.2
+        self._timer = QTimer(self)
+        self._timer.setInterval(TRAIL_TICK_MS)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self, global_pos, duration):
+        self._duration = max(0.05, float(duration))
+        self._samples = [(time.monotonic(), QPoint(global_pos))]
+        self._timer.start()
+        self._tick()
+
+    def push(self, global_pos):
+        if self._timer.isActive():
+            self._samples.append((time.monotonic(), QPoint(global_pos)))
+
+    def stop(self):
+        self._timer.stop()
+        self._samples = []
+        self.hide()
+        self.deleteLater()
+
+    def _tick(self):
+        now = time.monotonic()
+        self._samples = [
+            sample for sample in self._samples if now - sample[0] <= self._duration
+        ]
+        if not self._samples:
+            self.hide()
+            return
+        xs = [point.x() for _, point in self._samples]
+        ys = [point.y() for _, point in self._samples]
+        x = min(xs) - self._pad
+        y = min(ys) - self._pad
+        self.setGeometry(
+            int(x), int(y), int(max(xs) - x + self._pad), int(max(ys) - y + self._pad)
+        )
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def paintEvent(self, event):
+        now = time.monotonic()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        for stamp, point in self._samples:
+            fade = 1.0 - (now - stamp) / self._duration
+            if fade <= TRAIL_SKIP:
+                continue
+            frame = self._frames[
+                max(0, min(TRAIL_FRAMES - 1, int(fade * (TRAIL_FRAMES - 1))))
+            ]
+            painter.setOpacity(TRAIL_ALPHA / 255.0 * fade)
+            painter.drawPixmap(
+                point.x() - self.x() - frame.width() // 2,
+                point.y() - self.y() - frame.height() // 2,
+                frame,
+            )
+
+
+class DragGhost(QWidget):
+    """跨收纳区拖动时跟着鼠标走的幽灵窗口（不接收鼠标事件，纯展示）。"""
+
+    def __init__(self, pixmap, text=""):
+        super().__init__(
+            None,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._pixmap = pixmap
+        self._text = text
+        width = max(pixmap.width() + 16, 56)
+        height = pixmap.height() + 12 + (16 if text else 0)
+        self.resize(width, height)
+
+    def follow(self, global_pos):
+        self.move(
+            global_pos.x() - self.width() // 2,
+            global_pos.y() - self.height() // 2,
+        )
+        if not self.isVisible():
+            self.show()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setOpacity(0.88)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 210))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 9, 9)
+        painter.drawPixmap(
+            (self.width() - self._pixmap.width()) // 2, 6, self._pixmap
+        )
+        if self._text:
+            painter.setPen(QColor(theme.TEXT))
+            painter.drawText(
+                QRect(2, 6 + self._pixmap.height(), self.width() - 4, 16),
+                Qt.AlignHCenter | Qt.AlignVCenter,
+                self._text,
+            )
 
 
 class IconWidget(QWidget):
@@ -168,9 +400,10 @@ class IconWidget(QWidget):
     launch_requested = pyqtSignal(object)
     remove_requested = pyqtSignal(object)
     customize_requested = pyqtSignal(object, str)   # (item, rename / icon / restore)
+    move_zone_requested = pyqtSignal(object, str)   # (item, 目标收纳区 id)
     moved = pyqtSignal()
 
-    def __init__(self, item, icon_size, show_label, parent=None):
+    def __init__(self, item, icon_size, show_label, hide_arrow=False, parent=None):
         super().__init__(parent)
         self.item = item
         self.moved_by_user = False
@@ -180,12 +413,16 @@ class IconWidget(QWidget):
         self.label_opacity = 1.0
         self.label_color = theme.TEXT
         self._show_label = show_label
-        self._icon = load_item_icon(item, icon_size)
+        self._icon = load_item_icon(item, icon_size, hide_arrow)
         self._icon_px = icon_size
         self._hover = False
         self._dragging = False
         self._press_global = None
         self._press_pos = None
+        self._ghost = None       # 拖出面板后跟着鼠标的幽灵窗口
+        self._trail = None       # 拖动时的拖尾特效
+        self._outside = False    # 是否正拖在面板外（可能要落到别的收纳区）
+        self.trail_duration = 0.0   # 拖尾时长，0 表示不开拖尾
         # 不显示名称时靠提示辨认图标，所以提示显示名称而不是完整路径
         self.setToolTip(item.display_name if not show_label else "")
         self.setCursor(Qt.PointingHandCursor)
@@ -198,23 +435,37 @@ class IconWidget(QWidget):
             painter.setBrush(QColor(255, 255, 255, 170 if self._dragging else 120))
             painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 9, 9)
 
+        # 格子里垂直居中：图标在上、文字在下，作为一个整体居中，四周留白均匀
+        metrics = QFontMetrics(self.font())
+        if self._show_label:
+            block_h = self._icon_px + 3 + 2 * metrics.height()
+        else:
+            block_h = self._icon_px
+        block_top = max(2, (self.height() - block_h) // 2)
+
         icon_x = (self.width() - self._icon.width()) // 2
-        painter.setOpacity(_clamp(self.icon_opacity, 0.05, 1.0))
-        painter.drawPixmap(icon_x, 5, self._icon)
+        icon_y = block_top + max(0, (self._icon_px - self._icon.height()) // 2)
+        # 拖到面板外时留在原处的磁贴画淡一点，表明它正跟着鼠标走
+        dim = 0.4 if self._outside else 1.0
+        painter.setOpacity(_clamp(self.icon_opacity, 0.05, 1.0) * dim)
+        painter.drawPixmap(icon_x, icon_y, self._icon)
         if not self._show_label:
             return
 
-        painter.setOpacity(_clamp(self.label_opacity, 0.05, 1.0))
-        metrics = QFontMetrics(self.font())
-        line_h = metrics.height()
-        text_width = max(20, self.width() - 10)
-        lines = wrap_text(self.item.display_name, metrics, text_width)
+        painter.setOpacity(_clamp(self.label_opacity, 0.05, 1.0) * dim)
+        # 文字最多用到格子内边 2px：宽一点，长名字更容易完整放下
+        text_width = max(20, self.width() - 4)
+        # 紧贴图标下方（按图标实际底边算，图标扁的时候也不会留下空档）
+        top = icon_y + self._icon.height() + 2
+        label_font, lines, line_h = fit_label(
+            self.item.display_name, self.font(), text_width, self.height() - top
+        )
+        painter.setFont(label_font)
         painter.setPen(QColor(self.label_color))
-        top = 5 + self._icon.height() + 3
         for index, line in enumerate(lines):
             painter.drawText(
-                QRect(5, top + index * line_h, text_width, line_h),
-                Qt.AlignHCenter | Qt.AlignVCenter,
+                QRect(2, top + index * line_h, text_width, line_h),
+                Qt.AlignHCenter | Qt.AlignTop,
                 line,
             )
 
@@ -243,31 +494,101 @@ class IconWidget(QWidget):
         if not self._dragging and delta.manhattanLength() < 6:
             return
         self._dragging = True
+        self.update()
         # 自动排序开启时不允许挪动，但仍视为拖动，避免误触发打开
         if not self.draggable:
             return
+        self._start_trail(event.globalPos())
+        window = self.window()
+        if not window.frameGeometry().contains(event.globalPos()):
+            self._drag_outside(event.globalPos())
+            return
+        self._drag_inside(event.globalPos(), delta)
+
+    def _drag_inside(self, global_pos, delta):
+        """在面板内拖动：磁贴自由跟随鼠标，松手时才吸附到格子。"""
+        self._clear_ghost()
+        if not self.isVisible():
+            self.show()
         target = self._press_pos + delta
-        if self.grid is not None:
-            step_x, step_y, origin_x, origin_y = self.grid
-            target.setX(int(origin_x + round((target.x() - origin_x) / float(step_x)) * step_x))
-            target.setY(int(origin_y + round((target.y() - origin_y) / float(step_y)) * step_y))
         parent = self.parentWidget()
         target.setX(int(_clamp(target.x(), 0, parent.width() - self.width())))
         target.setY(int(_clamp(target.y(), 0, parent.height() - self.height())))
         self.move(target)
-        self.update()
+
+    def _snap_to_grid(self):
+        """松手时吸附到最近的格点（拖动过程中不吸附）。"""
+        if self.grid is None:
+            return
+        step_x, step_y, origin_x, origin_y = self.grid
+        x = int(origin_x + round((self.x() - origin_x) / float(step_x)) * step_x)
+        y = int(origin_y + round((self.y() - origin_y) / float(step_y)) * step_y)
+        parent = self.parentWidget()
+        x = int(_clamp(x, 0, parent.width() - self.width()))
+        y = int(_clamp(y, 0, parent.height() - self.height()))
+        self.move(x, y)
+
+    def _drag_outside(self, global_pos):
+        """拖出面板：磁贴留在原处并变淡，改用幽灵窗口跟随鼠标，好落到别的收纳区。
+
+        这里不能 hide() 磁贴：按住鼠标期间的事件靠隐式抓取送到磁贴，
+        一旦把它隐藏，移动和松手事件就都收不到了，图标会卡住、幽灵窗口留在屏幕上。
+        """
+        if self._ghost is None:
+            self._ghost = DragGhost(
+                self._icon, self.item.display_name if self._show_label else ""
+            )
+        self._ghost.follow(global_pos)
+        self._ghost.raise_()
+        if not self._outside:
+            self._outside = True
+            self.update()
+
+    def _clear_ghost(self):
+        if self._ghost is not None:
+            self._ghost.close()
+            self._ghost.deleteLater()
+            self._ghost = None
+        if self._outside:
+            self._outside = False
+            self.update()
+
+    def _start_trail(self, global_pos):
+        if self.trail_duration <= 0:
+            return
+        if self._trail is None:
+            self._trail = DragTrail(self._icon, self.window())
+            self._trail.start(global_pos, self.trail_duration)
+        else:
+            self._trail.push(global_pos)
+
+    def _stop_trail(self):
+        if self._trail is not None:
+            self._trail.stop()
+            self._trail = None
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton or self._press_global is None:
             return
         dragged = self._dragging
+        outside = self._outside
         self._press_global = None
         self._dragging = False
+        self._clear_ghost()
+        self._stop_trail()
+        if not self.isVisible():
+            self.show()
         self.update()
-        if dragged:
-            self.moved.emit()
-        else:
+        if not dragged:
             self.launch_requested.emit(self.item)
+            return
+        window = self.window()
+        if outside and hasattr(window, "handle_drop_out"):
+            if window.handle_drop_out(self, event.globalPos()):
+                return      # 已经移入别的收纳区，本面板的磁贴会被重建
+        elif not outside:
+            self._snap_to_grid()   # 松手才落到格子里
+        self.moved.emit()
 
     def contextMenuEvent(self, event):
         window = self.window()
@@ -282,6 +603,17 @@ class IconWidget(QWidget):
         if self.item.alias or self.item.icon_path:
             action_restore = menu.addAction("恢复默认名称与图标")
         menu.addSeparator()
+        # 换收纳区：也可以直接把图标拖到别的面板上
+        zone_actions = {}
+        zones = window.config.raw.zones()
+        if len(zones) > 1:
+            current = window.config.raw.zone_of(self.item.key)
+            submenu = menu.addMenu("移动到收纳区")
+            for zone in zones:
+                if zone.get("id") == current:
+                    continue
+                action = submenu.addAction(str(zone.get("name")))
+                zone_actions[action] = zone.get("id")
         action_remove = menu.addAction("从面板移除")
         window.hold_collapse()
         try:
@@ -300,6 +632,8 @@ class IconWidget(QWidget):
             self.customize_requested.emit(self.item, "restore")
         elif chosen is action_remove:
             self.remove_requested.emit(self.item)
+        elif chosen in zone_actions:
+            self.move_zone_requested.emit(self.item, zone_actions[chosen])
 
 
 class TooltipStyle(QProxyStyle):
@@ -337,14 +671,20 @@ class ScrollIndicator(QWidget):
 
 
 class Panel(QWidget):
-    """停靠在屏幕左/右侧的收录面板，可拖动、可调宽。"""
+    """一个收纳区的面板：停靠在屏幕左/右侧，可拖动、可调宽、可折叠。"""
 
     message = pyqtSignal(str)
+    move_zone_requested = pyqtSignal(object, str)   # 图标要换到别的收纳区
+    paths_dropped = pyqtSignal(object, list, object)   # 从桌面/资源管理器拖进来的文件
+    content_changed = pyqtSignal(object)   # 图标归属变了，其他面板也要刷新
 
-    def __init__(self, config, on_open_settings):
+    def __init__(self, config, zone, on_open_settings, on_drop_out=None):
         super().__init__(None)
-        self.config = config
+        self.config = ZoneConfig(config, zone)
+        self.zone = zone
         self._on_open_settings = on_open_settings
+        self._on_drop_out = on_drop_out
+        self._drop_hover = False     # 有文件正拖在面板上（画个提示边框）
 
         self.items = []
         self.icons = []
@@ -373,6 +713,8 @@ class Panel(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
+        # 接收从桌面 / 资源管理器拖过来的文件（子控件不接收，会自动冒泡到面板）
+        self.setAcceptDrops(True)
         self.setWindowTitle("桌面收录")
         self.setStyleSheet(
             "QLabel#title { color: %s; font-size: 13px; font-weight: 600; }"
@@ -384,19 +726,23 @@ class Panel(QWidget):
 
         self.title = QLabel(self)
         self.title.setObjectName("title")
-        self._apply_title()
         self.btn_settings = QToolButton(self)
         self.btn_settings.setText("⚙")
         self.btn_settings.setFont(QFont("Segoe UI Symbol", 12))
         self.btn_settings.setToolTip("设置")
         self.btn_settings.clicked.connect(self._open_settings)
+        self.btn_collapse = QToolButton(self)
+        self.btn_collapse.setFont(QFont("Segoe UI Symbol", 11))
+        self.btn_collapse.setToolTip("折叠 / 展开本收纳区")
+        self.btn_collapse.clicked.connect(self.toggle_collapsed)
         self.btn_close = QToolButton(self)
         self.btn_close.setText("✕")
         self.btn_close.setFont(QFont("Segoe UI Symbol", 11))
         self.btn_close.setToolTip("收起面板")
         self.btn_close.clicked.connect(self.collapse)
+        self._apply_title()
 
-        self.empty_hint = QLabel("桌面暂无可收录的图标", self)
+        self.empty_hint = QLabel(self._empty_text(), self)
         self.empty_hint.setObjectName("empty")
         self.empty_hint.setAlignment(Qt.AlignCenter)
         self.empty_hint.setWordWrap(True)
@@ -451,10 +797,17 @@ class Panel(QWidget):
         self.refresh()
 
     def refresh(self):
-        """重新扫描桌面并重建全部图标。"""
-        self.items = scan(
-            self.config.get("excluded"), self.config.get("custom")
-        )
+        """重新扫描桌面并重建本收纳区的图标。"""
+        zone_id = self.zone.get("id")
+        raw = self.config.raw
+        self.items = [
+            item
+            for item in scan(
+                self.config.get("excluded"), self.config.get("custom")
+            )
+            if raw.zone_of(item.key) == zone_id
+        ]
+        self.empty_hint.setText(self._empty_text())
         self._watch_desktop()
         # 套用自定义名称与图标（只影响显示，不动原文件）
         aliases = self.config.get("aliases")
@@ -465,6 +818,7 @@ class Panel(QWidget):
             item.alias = str(aliases.get(item.key) or "")
             item.icon_path = str(icons.get(item.key) or "")
         for widget in self.icons:
+            widget._stop_trail()
             widget.setParent(None)
             widget.deleteLater()
         self.icons = []
@@ -474,9 +828,12 @@ class Panel(QWidget):
         icon_opacity = float(self.config.get("icon_opacity", 1.0))
         label_opacity = float(self.config.get("label_opacity", 1.0))
         label_color = str(self.config.get("label_color") or theme.TEXT)
+        hide_arrow = bool(self.config.get("hide_shortcut_arrow"))
+        trail_duration = self.trail_duration()
         for item in self.items:
-            widget = IconWidget(item, icon_px, show_label, self._area)
+            widget = IconWidget(item, icon_px, show_label, hide_arrow, self._area)
             widget.setFont(font)
+            widget.trail_duration = trail_duration
             widget.icon_opacity = icon_opacity
             widget.label_opacity = label_opacity
             widget.label_color = label_color
@@ -484,6 +841,7 @@ class Panel(QWidget):
             widget.launch_requested.connect(self._launch)
             widget.remove_requested.connect(self._remove)
             widget.customize_requested.connect(self._customize)
+            widget.move_zone_requested.connect(self._on_move_zone)
             widget.moved.connect(self._on_moved)
             widget.show()
             self.icons.append(widget)
@@ -496,9 +854,101 @@ class Panel(QWidget):
         self.refresh()
         self.update()
 
+    def set_zone(self, zone):
+        """设置界面改完收纳区后，把面板指向最新的那份区数据。"""
+        self.zone = zone
+        self.config.zone = zone
+        self._apply_title()
+
     def _apply_title(self):
         text = str(self.config.get("panel_title") or "").strip()
         self.title.setText(text or "桌面收录")
+        self.btn_collapse.setText(self._collapsed_text())
+
+    # ---------- 收纳区 ----------
+
+    def _collapsed_text(self):
+        return "▸" if self.zone.get("collapsed") else "▾"
+
+    def _empty_text(self):
+        raw = self.config.raw
+        first = raw.first_zone_id()
+        if self.zone.get("id") == first or not raw.zones():
+            return "桌面暂无可收录的图标"
+        return "本收纳区还没有图标\n把图标拖进来，或右键图标选「移动到收纳区」"
+
+    def toggle_collapsed(self):
+        """折叠/展开本收纳区，只留标题栏或恢复完整面板。"""
+        collapsed = not bool(self.zone.get("collapsed"))
+        self.zone["collapsed"] = collapsed
+        self.config.save()
+        self.btn_collapse.setText(self._collapsed_text())
+        self._apply_layout()
+        self.message.emit(
+            "「%s」已折叠" % self.zone.get("name") if collapsed
+            else "「%s」已展开" % self.zone.get("name")
+        )
+
+    def handle_drop_out(self, widget, global_pos):
+        """磁贴被拖到面板外：交给主控判断有没有落到别的收纳区。"""
+        if self._on_drop_out is None:
+            return False
+        return bool(self._on_drop_out(widget.item, global_pos))
+
+    def _on_move_zone(self, item, zone_id):
+        """右键菜单换区，交给主控处理。"""
+        self.move_zone_requested.emit(item, zone_id)
+
+    # ---------- 接住从桌面 / 资源管理器拖过来的文件 ----------
+
+    @staticmethod
+    def _dropped_paths(mime):
+        if mime is None or not mime.hasUrls():
+            return []
+        paths = []
+        for url in mime.urls():
+            if url.isLocalFile():
+                paths.append(url.toLocalFile())
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+            self._drop_hover = True
+            self.hold_collapse()
+            self.update()
+
+    def dragMoveEvent(self, event):
+        if self._dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._drop_hover = False
+        self.release_collapse()
+        self.update()
+
+    def dropEvent(self, event):
+        paths = self._dropped_paths(event.mimeData())
+        self._drop_hover = False
+        self.release_collapse()
+        self.update()
+        if not paths:
+            return
+        event.acceptProposedAction()
+        if self.zone.get("collapsed"):
+            self.toggle_collapsed()   # 折叠状态下也能拖进来，顺手展开给用户看
+        self.paths_dropped.emit(self, paths, self.mapToGlobal(event.pos()))
+
+    def drop_point(self, global_pos):
+        """屏幕坐标换算成本面板里的落点（按网格对齐并夹在面板内）。"""
+        local = self.mapFromGlobal(global_pos)
+        x = local.x() - self._tile_w // 2
+        y = local.y() + self._scroll - HEADER_H - self._tile_h // 2
+        if self.config.get("snap_to_grid"):
+            x, y = self._cell_point(*self._cell_at(x, y))
+        area = self._area.geometry()
+        x = int(_clamp(x, area.x(), max(area.x(), self._w - self._tile_w)))
+        return (x, max(HEADER_H + PAD, int(y)))
 
     # ---------- 显示与隐藏 ----------
 
@@ -557,9 +1007,26 @@ class Panel(QWidget):
         if not self._leave_timer.isActive():
             self._leave_timer.start(LEAVE_DELAY)
 
+    def _icon_dragging(self):
+        """是否有磁贴正在被拖动（跨区拖动时别把面板收起来）。"""
+        dragging = [w for w in self.icons if getattr(w, "_dragging", False)]
+        if dragging and not QApplication.mouseButtons() & Qt.LeftButton:
+            # 松手事件没送到（被系统或别的程序抢走）时清理残留标记，
+            # 否则面板会一直以为在拖动，再也收不起来
+            for widget in dragging:
+                widget._dragging = False
+                widget._clear_ghost()
+                widget._stop_trail()
+                widget.update()
+            return False
+        return bool(dragging)
+
     def _check_cursor(self):
         """主动检测光标是否还在面板上，比等待 leaveEvent 更及时。"""
         if self._pinned or self._drag_mode or self._collapse_held or self._drag_hold:
+            return
+        if self._icon_dragging():
+            self._leave_timer.stop()
             return
         if self._cursor_inside():
             self._leave_timer.stop()
@@ -592,7 +1059,7 @@ class Panel(QWidget):
     def _maybe_collapse(self):
         if self._pinned or self._drag_mode or self._collapse_held or self._drag_hold:
             return
-        if self._cursor_inside():
+        if self._icon_dragging() or self._cursor_inside():
             return
         self.collapse()
 
@@ -622,9 +1089,10 @@ class Panel(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = event.pos()
-        if self._near_inner_edge(pos):
+        collapsed = bool(self.zone.get("collapsed"))
+        if not collapsed and self._near_inner_edge(pos):
             self._drag_mode = "width"
-        elif self._near_bottom_edge(pos):
+        elif not collapsed and self._near_bottom_edge(pos):
             self._drag_mode = "height"
         elif pos.y() <= HEADER_H:
             self._drag_mode = "move"
@@ -818,35 +1286,53 @@ class Panel(QWidget):
             self.refresh()
 
     def pick_and_add(self, folder=False):
-        if folder:
-            path = QFileDialog.getExistingDirectory(None, "选择要收录的文件夹")
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                None,
-                "选择要收录的文件或程序",
-                "",
-                "程序 (*.exe *.bat *.cmd *.lnk);;所有文件 (*.*)",
-            )
-        if path:
-            self.add_custom(path)
+        """选文件/文件夹期间面板不收起，选完把面板亮出来让用户看到结果。"""
+        self.hold_collapse()
+        try:
+            if folder:
+                path = QFileDialog.getExistingDirectory(
+                    self.window(), "选择要收录的文件夹"
+                )
+            else:
+                path, _ = QFileDialog.getOpenFileName(
+                    self.window(),
+                    "选择要收录的文件或程序",
+                    "",
+                    "程序 (*.exe *.bat *.cmd *.lnk);;所有文件 (*.*)",
+                )
+        finally:
+            self.release_collapse()
+        if not path:
+            return
+        self.add_custom(path)
+        if not self._revealed:
+            self.reveal(pinned=False)
 
     def add_custom(self, path):
-        """把桌面之外的路径收录进面板。"""
+        """把路径收录进本收纳区（桌面之外的路径会记进手动添加列表）。"""
         full = os.path.abspath(path)
         key = os.path.normcase(full)
-        custom = list(self.config.get("custom") or [])
-        if any(os.path.normcase(item) == key for item in custom):
+        raw = self.config.raw
+        zone_id = self.zone.get("id")
+        custom = list(raw.get("custom") or [])
+        excluded = list(raw.get("excluded") or [])
+        in_custom = any(os.path.normcase(item) == key for item in custom)
+        # 只有在面板上真的看得到（没被移除）才算「已经在面板里」
+        if in_custom and raw.zone_of(key) == zone_id and key not in excluded:
             self.message.emit("「%s」已经在面板里了" % os.path.basename(full))
             return
-        custom.append(full)
-        self.config.set("custom", custom)
+        if not in_custom:
+            custom.append(full)
+        raw.set("custom", custom)
+        # 关键：归到本收纳区，否则会落到第一个区、在当前面板上看不到
+        mapping = dict(raw.get("zone_of") or {})
+        mapping[key] = zone_id
+        raw.set("zone_of", mapping)
         # 之前被移除过的话一并取消排除
-        self.config.set(
-            "excluded",
-            [item for item in (self.config.get("excluded") or []) if item != key],
-        )
-        self.config.save()
+        raw.set("excluded", [item for item in excluded if item != key])
+        raw.save()
         self.refresh()
+        self.content_changed.emit(self)     # 原来在别的区的话，那边也要刷新
         self.message.emit("已添加「%s」" % os.path.basename(full))
 
     def wheelEvent(self, event):
@@ -910,14 +1396,24 @@ class Panel(QWidget):
 
     def _tile_size(self):
         icon_px = int(self.config.get("icon_size"))
+        # 格子宽度只跟图标有关：显示文字不再把网格横向撑大
+        width = icon_px + TILE_TEXT_PAD_MIN
         if self.config.get("show_label"):
             line_h = QFontMetrics(self.label_font()).height()
-            return icon_px + TILE_TEXT_PAD, icon_px + 2 * line_h + 17
-        return icon_px + TILE_TEXT_PAD_MIN, icon_px + 16
+            # 文字紧贴图标下方，只多出文字本身的高度，四周留白与不显示文字时一致
+            return width, icon_px + 3 + 2 * line_h + 16
+        return width, icon_px + 16
 
     def label_font(self):
         size = int(self.config.get("label_font_size") or 9)
         return QFont(theme.FONT_FAMILY, max(6, min(20, size)))
+
+    def trail_duration(self):
+        """拖尾时长（秒），0 表示关闭；档位越大尾巴越长。"""
+        if not self.config.get("drag_trail"):
+            return 0.0
+        level = int(_clamp(int(self.config.get("drag_trail_length") or 5), 1, 10))
+        return (TRAIL_BASE_MS + (level - 1) * TRAIL_STEP_MS) / 1000.0
 
     def _compute_geometry(self):
         screen = self._screen()
@@ -947,6 +1443,8 @@ class Panel(QWidget):
         preferred_height = int(self.config.get("panel_height") or 0)
         height = preferred_height if preferred_height > 0 else auto_height
         height = int(_clamp(height, MIN_HEIGHT, max_height))
+        if self.zone.get("collapsed"):
+            height = COLLAPSED_H   # 折叠后只剩标题栏
 
         self._w = width
         self._h = height
@@ -993,6 +1491,12 @@ class Panel(QWidget):
         # 尺寸变化后重新夹紧滚动位置
         self._scroll = int(_clamp(self._scroll, 0, self.max_scroll()))
         self._place_icons()
+        collapsed = bool(self.zone.get("collapsed"))
+        self._area.setVisible(not collapsed)
+        self._scrollbar.setVisible(not collapsed)
+        self.empty_hint.setVisible(not collapsed and not self.icons)
+        for widget in self.icons:
+            widget.setVisible(not collapsed)
         self.move(self._shown_point() if self._revealed else self._hidden_point())
         if self.config.get("edge_hover") or self._revealed:
             self.show()
@@ -1000,11 +1504,12 @@ class Panel(QWidget):
             self.hide()
 
     def _place_chrome(self):
-        title_width = max(40, self._w - 3 * PAD - 62)
+        title_width = max(40, self._w - 3 * PAD - 88)
         self.title.setGeometry(PAD + 4, 0, title_width, HEADER_H)
         button_y = (HEADER_H - 24) // 2
         self.btn_close.setGeometry(self._w - PAD - 24, button_y, 24, 24)
         self.btn_settings.setGeometry(self._w - PAD - 50, button_y, 24, 24)
+        self.btn_collapse.setGeometry(self._w - PAD - 76, button_y, 24, 24)
         self.empty_hint.setGeometry(PAD, HEADER_H + 20, self._w - 2 * PAD, 60)
 
         # 内边留出调宽/调高的拖动带，其余区域交给图标容器
@@ -1024,6 +1529,40 @@ class Panel(QWidget):
         height = max(20, self._h - HEADER_H - RESIZE_BAND)
         return QRect(x, HEADER_H, width, height)
 
+    def _cell_point(self, column, row):
+        """格子左上角的面板坐标。"""
+        return (
+            PAD + column * (self._tile_w + GAP),
+            HEADER_H + PAD + row * (self._tile_h + GAP),
+        )
+
+    def _cell_at(self, x, y):
+        """面板坐标落在哪个格子上（就近取整，不越出面板宽度）。"""
+        step_x = self._tile_w + GAP
+        step_y = self._tile_h + GAP
+        column = int(round((x - PAD) / float(step_x)))
+        row = int(round((y - HEADER_H - PAD) / float(step_y)))
+        return (int(_clamp(column, 0, self._cols - 1)), max(0, row))
+
+    def _nearest_free_cell(self, column, row, used):
+        """从指定格子往外一圈圈找最近的空格子，保证挤过去的图标也有位置。"""
+        for radius in range(0, 400):
+            best = None
+            for dc in range(-radius, radius + 1):
+                for dr in range(-radius, radius + 1):
+                    if max(abs(dc), abs(dr)) != radius:
+                        continue
+                    c = column + dc
+                    r = row + dr
+                    if c < 0 or c > self._cols - 1 or r < 0 or (c, r) in used:
+                        continue
+                    distance = dc * dc + dr * dr
+                    if best is None or distance < best[0]:
+                        best = (distance, c, r)
+            if best is not None:
+                return (best[1], best[2])
+        return (column, max(0, row))
+
     def _place_icons(self):
         positions = self.config.get("positions")
         if not isinstance(positions, dict):
@@ -1033,37 +1572,75 @@ class Panel(QWidget):
         area = self._area.geometry()
         step_x = self._tile_w + GAP
         step_y = self._tile_h + GAP
-        taken = []
-        slot = 0
         for widget in self.icons:
             widget.resize(self._tile_w, self._tile_h)
             widget.draggable = True      # 始终可以自由拖动
             # 网格对齐用的是自动排列的格点（容器坐标）
             widget.grid = (step_x, step_y, PAD - area.x(), PAD) if snap else None
+
+        placed = []      # 已经放好的位置（面板坐标）
+        used = set()     # 已经被占用的格子：一个格子只放一个图标
+        fixed = []       # (图标, 面板坐标)，最终要落到界面上的结果
+        manual = []      # 用户摆过的图标先落位
+        pending = []     # 其余图标再补空格子
+        for widget in self.icons:
             saved = None if auto_sort else positions.get(widget.item.key)
             if isinstance(saved, (list, tuple)) and len(saved) == 2:
-                x, y = int(saved[0]), int(saved[1])
                 # 位置是用户摆过的，重新扫描后要保留，不能被当成自动排列清掉
                 widget.moved_by_user = True
+                if snap:
+                    point = self._cell_point(*self._cell_at(int(saved[0]), int(saved[1])))
+                else:
+                    point = (int(saved[0]), int(saved[1]))
+                manual.append((widget, point))
             else:
-                x = y = None
-                while slot < 4000:
-                    column, row = divmod(slot, self._rows)
-                    slot += 1
-                    column = min(column, self._cols - 1)
-                    candidate_x = PAD + column * step_x
-                    candidate_y = HEADER_H + PAD + row * step_y
-                    if not _overlaps(
-                        candidate_x, candidate_y, taken, self._tile_w, self._tile_h
-                    ):
-                        x, y = candidate_x, candidate_y
-                        break
-                if x is None:
-                    x, y = PAD, HEADER_H + PAD
-            # 面板坐标 -> 容器坐标（容器顶部为内容原点，再叠加滚动偏移）
-            x = int(_clamp(x - area.x(), 0, max(0, area.width() - self._tile_w)))
-            y = int(y - HEADER_H - self._scroll)
-            taken.append((x + area.x(), y + HEADER_H + self._scroll))
+                pending.append(widget)
+
+        def blocked(column, row, point):
+            if snap and (column, row) in used:
+                return True
+            return _overlaps(point[0], point[1], placed, self._tile_w, self._tile_h)
+
+        for widget, point in manual:
+            cell = self._cell_at(point[0], point[1])
+            if blocked(cell[0], cell[1], point):
+                # 改过图标大小或开关过文字后原来那格可能已被占用，挪到最近的空格子
+                cell = self._nearest_free_cell(cell[0], cell[1], used)
+                point = self._cell_point(*cell)
+            used.add(cell)
+            placed.append(point)
+            fixed.append((widget, point))
+
+        slot = 0
+        for widget in pending:
+            point = None
+            while slot < self._cols * self._rows:
+                column, row = divmod(slot, self._rows)
+                slot += 1
+                candidate = self._cell_point(column, row)
+                if blocked(column, row, candidate):
+                    continue
+                point = candidate
+                used.add((column, row))
+                break
+            if point is None:
+                cell = self._nearest_free_cell(0, 0, used)
+                used.add(cell)
+                point = self._cell_point(*cell)
+            placed.append(point)
+            fixed.append((widget, point))
+
+        # 被挤到原规划之外的行时把内容区加高，滚轮才能看到它
+        rows_used = max((cell[1] for cell in used), default=0) + 1
+        if rows_used > self._rows:
+            self._rows = rows_used
+            self._content_h = 2 * PAD + self._rows * step_y
+            self._scroll = int(_clamp(self._scroll, 0, self.max_scroll()))
+
+        # 面板坐标 -> 容器坐标（容器顶部为内容原点，再叠加滚动偏移）
+        for widget, point in fixed:
+            x = int(_clamp(point[0] - area.x(), 0, max(0, area.width() - self._tile_w)))
+            y = int(point[1] - HEADER_H - self._scroll)
             widget.move(x, y)
         self.empty_hint.setVisible(not self.icons)
 
@@ -1096,6 +1673,7 @@ class Panel(QWidget):
         self.config.set("excluded", excluded)
         self.config.save()
         self.refresh()
+        self.content_changed.emit(self)
         self.message.emit("已移除「%s」，可在托盘菜单中恢复" % item.name)
 
     def _customize(self, item, action):
@@ -1162,12 +1740,38 @@ class Panel(QWidget):
         sender = self.sender()
         if isinstance(sender, IconWidget):
             sender.moved_by_user = True
+            self._push_aside(sender)
         if self.config.get("auto_sort"):
             # 手动摆过就视为接管排列，自动排序自动关闭，否则位置会被它覆盖掉
             self.config.set("auto_sort", False)
             self.config.save()
             self.message.emit("已手动摆放图标，自动排序已关闭")
         self._save_timer.start()
+
+    def _push_aside(self, dragged):
+        """拖到已有图标的格子上时，把被压住的图标挤到最近的空格子。"""
+        area = self._area.geometry()
+
+        def panel_point(widget):
+            return (widget.x() + area.x(), widget.y() + HEADER_H + self._scroll)
+
+        drop = panel_point(dragged)
+        used = {self._cell_at(*panel_point(widget)) for widget in self.icons}
+        pushed = []
+        for widget in self.icons:
+            if widget is dragged:
+                continue
+            point = panel_point(widget)
+            if not _overlaps(drop[0], drop[1], [point], self._tile_w, self._tile_h):
+                continue
+            cell = self._nearest_free_cell(*self._cell_at(*point), used)
+            used.add(cell)
+            x, y = self._cell_point(*cell)
+            widget.move(x - area.x(), y - HEADER_H - self._scroll)
+            widget.moved_by_user = True
+            pushed.append(widget.item.display_name)
+        if pushed:
+            self.message.emit("「%s」已被挤到相邻空位" % "」「".join(pushed))
 
     # ---------- 桌面变动自动收录 ----------
 
@@ -1184,9 +1788,7 @@ class Panel(QWidget):
 
     def _on_watch_timeout(self):
         # 正在拖动时不重建控件，等下一次变动
-        if self._drag_mode or any(
-            getattr(widget, "_dragging", False) for widget in self.icons
-        ):
+        if self._drag_mode or self._icon_dragging():
             self._watch_timer.start()
             return
         self.refresh()
@@ -1236,6 +1838,18 @@ class Panel(QWidget):
 
         painter.setPen(QPen(_rgba(theme.PANEL_BORDER, alpha * 0.8), 1))
         painter.drawLine(PAD, HEADER_H - 1, self.width() - PAD, HEADER_H - 1)
+
+        if self._drop_hover:
+            # 有文件正拖在面板上：套一圈高亮，提示可以松手放进来了
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(58, 123, 255, 220), 3))
+            painter.drawPath(path)
+            painter.setPen(QPen(QColor(58, 123, 255, 230), 1))
+            painter.drawText(
+                QRectF(0, self.height() / 2 - 14, self.width(), 28),
+                Qt.AlignCenter,
+                "松手收进「%s」" % str(self.zone.get("name") or "收纳区"),
+            )
 
 
 def _rgba(rgb, alpha):
